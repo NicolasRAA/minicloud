@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / фронтенд
+node_modules/
+dist/
+build/
+.vite/
+
+# Переменные окружения и секреты
+.env
+.env.*
+!.env.example
+
+# Резервные копии draw.io
+*.drawio.bkp
+*.drawio.dtmp
+
+# IDE и ОС
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

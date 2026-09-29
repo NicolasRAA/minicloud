@@ -1,0 +1,154 @@
+// «Мини-облако»: логическая модель данных для dbdiagram.io.
+// Источник истины: schema.sql. Частичные индексы и CHECK-ограничения
+// в DBML выражаются не полностью, их условия приведены в примечаниях.
+
+Project minicloud {
+  database_type: 'PostgreSQL'
+  Note: 'Архитектурный паспорт, практическая работа № 2. Физическая схема: schema.sql'
+}
+
+Table users {
+  id uuid [pk, default: `gen_random_uuid()`]
+  email text [not null, note: 'уникален без учёта регистра']
+  password_hash text [not null, note: 'Argon2id, строка PHC']
+  display_name text [not null]
+  quota_bytes bigint [not null, default: 10737418240, note: '10 ГиБ по умолчанию']
+  used_bytes bigint [not null, default: 0, note: 'включая файлы в корзине']
+  created_at timestamptz [not null, default: `now()`]
+  disabled_at timestamptz
+  Indexes {
+    (`lower(email)`) [unique, name: 'users_email_uq']
+  }
+  Note: 'Учётные записи. Заводит администратор через CLI'
+}
+
+Table refresh_sessions {
+  id uuid [pk, default: `gen_random_uuid()`]
+  user_id uuid [not null]
+  family_id uuid [not null, note: 'цепочка ротации; при краже токена отзывается вся цепочка']
+  token_hash bytea [not null, unique, note: 'SHA-256 от refresh-токена']
+  user_agent text
+  created_at timestamptz [not null, default: `now()`]
+  expires_at timestamptz [not null]
+  rotated_at timestamptz
+  revoked_at timestamptz
+  Indexes {
+    user_id [name: 'refresh_sessions_user_idx']
+    family_id [name: 'refresh_sessions_family_idx']
+  }
+  Note: 'Refresh-токены с ротацией (RFC 9700)'
+}
+
+Table nodes {
+  id uuid [pk, default: `gen_random_uuid()`]
+  owner_id uuid [not null]
+  parent_id uuid [note: 'NULL только у корневой папки']
+  type text [not null, note: "'folder' | 'file'"]
+  name text [not null, note: '1..255 символов, без /; уникально среди соседей вне корзины']
+  blob_id uuid [note: 'обязателен для файла, пуст для папки']
+  version integer [not null, default: 1, note: 'основа ETag, растёт при каждом изменении']
+  trashed_at timestamptz
+  trash_root_id uuid [note: 'узел, удалённый явно; у потомков указывает на него']
+  purge_after timestamptz [note: 'trashed_at + 30 дней, только у trash_root']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+  Indexes {
+    owner_id [unique, name: 'nodes_one_root_uq', note: 'частичный: WHERE parent_id IS NULL']
+    (parent_id, `lower(name)`) [unique, name: 'nodes_sibling_name_uq', note: 'частичный: WHERE trashed_at IS NULL']
+    (parent_id, type, `lower(name)`, id) [name: 'nodes_listing_idx', note: 'type DESC; частичный: WHERE trashed_at IS NULL']
+    parent_id [name: 'nodes_parent_idx']
+    (owner_id, trashed_at, id) [name: 'nodes_trash_idx', note: 'trashed_at DESC; частичный: WHERE trash_root_id = id']
+    trash_root_id [name: 'nodes_trash_root_idx', note: 'частичный: WHERE trash_root_id IS NOT NULL']
+    purge_after [name: 'nodes_purge_idx', note: 'частичный: WHERE purge_after IS NOT NULL']
+    blob_id [name: 'nodes_blob_idx', note: 'частичный: WHERE blob_id IS NOT NULL']
+  }
+  Note: 'Дерево папок и файлов; корзина через мягкое удаление'
+}
+
+Table blobs {
+  id uuid [pk, default: `gen_random_uuid()`]
+  owner_id uuid [not null]
+  content_hash bytea [not null, note: '32 байта, блочный SHA-256 (блоки по 4 МиБ)']
+  size_bytes bigint [not null]
+  mime_type text [not null, default: 'application/octet-stream']
+  storage_key text [not null, unique, note: 'ключ объекта в S3: u/{owner_id}/{upload_id}']
+  status text [not null, default: 'verifying', note: "'verifying' | 'available' | 'corrupted'"]
+  has_preview boolean [not null, default: false]
+  created_at timestamptz [not null, default: `now()`]
+  verified_at timestamptz
+  Indexes {
+    (owner_id, content_hash) [unique, name: 'blobs_owner_hash_uq', note: "частичный: WHERE status <> 'corrupted'"]
+  }
+  Note: 'Содержимое файлов; дедупликация только внутри владельца'
+}
+
+Table upload_sessions {
+  id uuid [pk, default: `gen_random_uuid()`]
+  owner_id uuid [not null]
+  parent_id uuid [not null, note: 'папка назначения']
+  name text [not null]
+  size_bytes bigint [not null]
+  content_hash bytea [not null]
+  mime_type text
+  part_size integer [not null, note: 'не меньше 5 МиБ (минимум S3); сейчас сервер берёт 8 МиБ']
+  part_count integer [not null, note: '0..10 000; 0, если байты передавать не нужно']
+  storage_key text
+  s3_upload_id text [note: 'UploadId составной загрузки S3; NULL, если байты не передаются']
+  status text [not null, default: 'active', note: "'active' | 'completing' | 'completed' | 'aborted' | 'expired'"]
+  node_id uuid [unique, note: 'созданный файл, заполняется при completed']
+  created_at timestamptz [not null, default: `now()`]
+  expires_at timestamptz [not null, note: 'created_at + 7 дней']
+  completed_at timestamptz
+  Indexes {
+    (owner_id, parent_id, `lower(name)`, content_hash) [unique, name: 'upload_sessions_active_uq', note: "частичный: WHERE status = 'active'"]
+    expires_at [name: 'upload_sessions_expiry_idx', note: "частичный: WHERE status IN ('active', 'completing')"]
+    parent_id [name: 'upload_sessions_parent_idx']
+  }
+  Note: 'Сессии возобновляемой загрузки (S3 multipart)'
+}
+
+Table shares {
+  id uuid [pk, default: `gen_random_uuid()`]
+  node_id uuid [not null]
+  created_by uuid [not null]
+  token_hash bytea [not null, unique, note: 'SHA-256 от токена из ссылки']
+  expires_at timestamptz [not null]
+  revoked_at timestamptz
+  access_count integer [not null, default: 0]
+  last_accessed_at timestamptz
+  created_at timestamptz [not null, default: `now()`]
+  Indexes {
+    node_id [name: 'shares_node_idx']
+  }
+  Note: 'Гостевые ссылки на файлы'
+}
+
+Table node_events {
+  seq bigint [pk, increment]
+  owner_id uuid [not null]
+  node_id uuid [not null, note: 'логическая ссылка на nodes.id без FK: запись переживает удаление узла']
+  kind text [not null, note: "'created' | 'updated' | 'trashed' | 'restored' | 'status_changed' | 'purged'"]
+  node_name text [not null]
+  parent_id uuid
+  actor text [not null, note: "'user' | 'system'"]
+  details jsonb [not null, default: `'{}'::jsonb`]
+  occurred_at timestamptz [not null, default: `now()`]
+  Indexes {
+    (owner_id, seq) [name: 'node_events_feed_idx']
+    (node_id, seq) [name: 'node_events_node_idx']
+  }
+  Note: 'Журнал изменений: лента /changes и история действий; хранится 90 дней'
+}
+
+Ref: refresh_sessions.user_id > users.id [delete: cascade]
+Ref: nodes.owner_id > users.id [delete: cascade]
+Ref: nodes.parent_id > nodes.id
+Ref: nodes.trash_root_id > nodes.id
+Ref: nodes.blob_id > blobs.id
+Ref: blobs.owner_id > users.id [delete: cascade]
+Ref: upload_sessions.owner_id > users.id [delete: cascade]
+Ref: upload_sessions.parent_id > nodes.id
+Ref: nodes.id - upload_sessions.node_id
+Ref: shares.node_id > nodes.id [delete: cascade]
+Ref: shares.created_by > users.id [delete: cascade]
+Ref: node_events.owner_id > users.id [delete: cascade]

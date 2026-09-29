@@ -1,0 +1,1344 @@
+openapi: 3.0.3
+info:
+  title: Мини-облако API
+  version: 1.0.0
+  description: |
+    Контракт между PWA-клиентом «Мини-облака» и сервером. Спецификацию пишем
+    руками до кода (contract-first); сгенерированный FastAPI документ сверяется
+    с этим файлом в CI.
+
+    **Общие правила**
+
+    * Все ответы и тела запросов в JSON (UTF-8). Время в UTC, формат RFC 3339.
+    * Идентификаторы: UUID. Вместо UUID корневой папки можно писать `root`,
+      вместо идентификатора корзины `trash` (только для просмотра списка).
+    * Байты файлов через API не проходят. Загрузка идёт частями прямо в
+      S3-хранилище по подписанным ссылкам, скачивание по `download_url`.
+    * Списки отдаются страницами по курсору: `next_cursor` из ответа
+      передаётся в параметре `cursor` следующего запроса.
+    * Изменение и удаление узла требуют заголовка `If-Match` со значением
+      `ETag` (это версия узла в кавычках, например `"3"`). Если узел успел
+      измениться, сервер ответит 412, если заголовка нет, то 428.
+    * Ответы с данными пользователя приходят с `Cache-Control: no-store`.
+    * Повтор любого запроса после обрыва связи безопасен: создание папки
+      возвращает уже созданную папку, загрузка находится по папке, имени и
+      хэшу, завершение загрузки повторяет прежний результат, PATCH защищён
+      `If-Match`, а DELETE идемпотентен по определению.
+
+    **Ошибки** приходят в формате `application/problem+json` (RFC 9457).
+    Поле `type` различает причины:
+
+    | type | Код | Когда |
+    |---|---|---|
+    | `/problems/malformed-request` | 400 | тело не разбирается как JSON |
+    | `/problems/unauthorized` | 401 | нет токена, токен истёк, неверный пароль, refresh-токен отозван |
+    | `/problems/not-found` | 404 | узла нет или он принадлежит другому пользователю |
+    | `/problems/name-conflict` | 409 | имя уже занято в папке |
+    | `/problems/invalid-move` | 409 | перенос папки в саму себя, изменение корня, цель в корзине |
+    | `/problems/not-in-trash` | 409 | окончательно удалить можно только узел из корзины |
+    | `/problems/not-shareable` | 409 | ссылку можно выдать только на проверенный файл вне корзины |
+    | `/problems/quota-exceeded` | 409 | файл не помещается в квоту |
+    | `/problems/upload-incomplete` | 409 | загружены не все части |
+    | `/problems/upload-closed` | 409 | сессия загрузки отменена, истекла или уже завершается |
+    | `/problems/gone` | 410 | ссылка отозвана или истекла, курсор ленты устарел |
+    | `/problems/precondition-failed` | 412 | `If-Match` не совпал с текущей версией |
+    | `/problems/validation` | 422 | ошибки в полях, список в `errors` |
+    | `/problems/precondition-required` | 428 | нет `If-Match` |
+    | `/problems/rate-limited` | 429 | превышен лимит запросов |
+
+    Полные адреса типов начинаются с `https://minicloud.example`.
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+servers:
+  - url: https://minicloud.example/api/v1
+    description: Стенд (адрес условный)
+  - url: /api/v1
+    description: Тот же хост, с которого открыт документ (локальный запуск через docker compose)
+tags:
+  - name: auth
+    description: Вход, обновление токенов, выход, профиль
+  - name: nodes
+    description: Папки, файлы и корзина
+  - name: uploads
+    description: Загрузка файлов частями с докачкой
+  - name: shares
+    description: Гостевые ссылки на файлы
+  - name: changes
+    description: Лента изменений для синхронизации вкладок и устройств
+security:
+  - bearerAuth: []
+
+paths:
+  /auth/tokens:
+    post:
+      tags: [auth]
+      operationId: issueTokens
+      summary: Войти по паролю или обновить токены
+      description: |
+        Выдаёт access-токен (JWT на 15 минут) в теле ответа и refresh-токен в
+        cookie `mc_refresh` с флагами HttpOnly, Secure, SameSite=Strict.
+        Cookie ограничена путём `/api/v1/auth/tokens`, поэтому остальные
+        запросы её не несут.
+
+        * `type: password`: вход по email и паролю. Пароли хранятся как
+          Argon2id. Не больше 5 попыток в минуту на пару «IP + email».
+        * `type: refresh_token`: обмен refresh-токена из cookie на новую пару.
+          Старый токен после обмена недействителен (ротация по RFC 9700).
+          Повтор со старым токеном в течение 30 секунд считается повтором
+          запроса (ответ потерялся или две вкладки обновились одновременно) и
+          получает новую пару. Позже сервер считает это кражей и отзывает всю
+          цепочку токенов этого входа.
+
+        Это не OAuth 2.0: клиент у сервера один (своя PWA), сторонних
+        приложений нет.
+      security:
+        - {}
+        - refreshCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TokenRequest'
+            examples:
+              password:
+                summary: Вход по паролю
+                value:
+                  type: password
+                  email: anna@example.com
+                  password: correct horse battery staple
+              refresh:
+                summary: Обновление по cookie
+                value:
+                  type: refresh_token
+      responses:
+        '200':
+          description: Новая пара токенов
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/SetRefreshCookie'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    delete:
+      tags: [auth]
+      operationId: revokeTokens
+      summary: Выйти
+      description: |
+        Отзывает refresh-токен из cookie вместе со всей его цепочкой и стирает
+        cookie. Ответ всегда 204, даже если cookie нет или токен уже отозван.
+        Выданный access-токен доживает свои 15 минут, поэтому клиент удаляет
+        его из памяти сам.
+      security:
+        - {}
+        - refreshCookie: []
+      responses:
+        '204':
+          description: Сессия закрыта
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/ClearRefreshCookie'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /me:
+    get:
+      tags: [auth]
+      operationId: getProfile
+      summary: Профиль и квота текущего пользователя
+      responses:
+        '200':
+          description: Профиль
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /nodes/{folderId}/children:
+    parameters:
+      - $ref: '#/components/parameters/FolderId'
+    get:
+      tags: [nodes]
+      operationId: listChildren
+      summary: Содержимое папки или корзины
+      description: |
+        Обычная папка: сначала папки, потом файлы, внутри по имени без учёта
+        регистра. Для `trash` возвращаются узлы, удалённые пользователем явно,
+        от новых к старым; их содержимое можно открыть этим же запросом по id.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Страница списка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+    post:
+      tags: [nodes]
+      operationId: createFolder
+      summary: Создать папку
+      description: |
+        Если в папке уже есть папка с таким именем (без учёта регистра),
+        сервер не создаёт вторую, а возвращает существующую с кодом 200.
+        Поэтому повтор запроса после обрыва связи безопасен. Если имя занято
+        файлом, ответ 409. В `trash` создавать ничего нельзя.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FolderCreate'
+            example:
+              name: Отчёты
+      responses:
+        '201':
+          description: Папка создана
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Node'
+              examples:
+                folder:
+                  $ref: '#/components/examples/FolderNode'
+        '200':
+          description: Папка с таким именем уже была, возвращена она
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Node'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+
+  /nodes/{nodeId}:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [nodes]
+      operationId: getNode
+      summary: Метаданные узла и ссылка на скачивание
+      description: |
+        Для проверенного файла (`status: available`) в ответе есть
+        `download_url`: подписанная ссылка на S3 со сроком 5 минут. Браузер
+        скачивает файл по ней напрямую, минуя API. ETag отражает версию
+        метаданных узла, ссылка на скачивание в него не входит.
+      responses:
+        '200':
+          description: Узел
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Node'
+              examples:
+                file:
+                  $ref: '#/components/examples/FileNode'
+                folder:
+                  $ref: '#/components/examples/FolderNode'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [nodes]
+      operationId: updateNode
+      summary: Переименовать, переместить, убрать в корзину или восстановить
+      description: |
+        Меняются только переданные поля.
+
+        * `trashed: true` убирает узел в корзину вместе с содержимым. Через
+          30 дней фоновая задача удалит его окончательно.
+        * `trashed: false` восстанавливает узел. Если исходная папка сама в
+          корзине или уже удалена, узел возвращается в корень, если не указан
+          `parent_id`.
+        * Перенос папки внутрь её же потомка и любые изменения корня дают 409.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NodePatch'
+            examples:
+              rename:
+                summary: Переименование
+                value:
+                  name: ПР2 (финал).pdf
+              move:
+                summary: Перенос в другую папку
+                value:
+                  parent_id: ab588fc4-4b23-4bc2-8294-da3c6187c905
+              trash:
+                summary: В корзину
+                value:
+                  trashed: true
+              restore:
+                summary: Восстановление из корзины
+                value:
+                  trashed: false
+      responses:
+        '200':
+          description: Узел после изменения
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Node'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+    delete:
+      tags: [nodes]
+      operationId: deleteNode
+      summary: Удалить из корзины навсегда
+      description: |
+        Работает только для узла, который пользователь сам убрал в корзину.
+        Записи в базе удаляются сразу, объекты в S3 чистит фоновая задача.
+        Повторный DELETE вернёт 404, клиент считает это успехом.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '204':
+          description: Узел удалён
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+
+  /nodes/{nodeId}/shares:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [shares]
+      operationId: listShares
+      summary: Действующие ссылки на файл
+      responses:
+        '200':
+          description: Ссылки, которые ещё не истекли и не отозваны
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShareList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [shares]
+      operationId: createShare
+      summary: Создать гостевую ссылку
+      description: |
+        Ссылку можно выдать только на файл со статусом `available`, который не
+        в корзине. Папками делиться пока нельзя. Полный адрес ссылки (`url`)
+        приходит один раз, в этом ответе: в базе хранится только SHA-256
+        токена. Повтор запроса создаст вторую ссылку; это безопасно, лишнюю
+        видно в списке и её можно отозвать.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ShareCreate'
+            example:
+              expires_in_days: 7
+      responses:
+        '201':
+          description: Ссылка создана
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Share'
+              example:
+                id: 0d71da9b-5fac-4f1f-859b-6239d18394ab
+                node_id: 16e7dfaf-cbc1-4e53-be83-d2a58cf189cf
+                url: https://minicloud.example/s/Kr6ez18yrIhhIgUHzpP3x3pMVmxVWmdnYs-dhRAvFRg
+                created_at: '2026-09-29T10:20:00Z'
+                expires_at: '2026-10-06T10:20:00Z'
+                access_count: 0
+                last_accessed_at: null
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+
+  /shares/{shareId}:
+    parameters:
+      - $ref: '#/components/parameters/ShareId'
+    delete:
+      tags: [shares]
+      operationId: revokeShare
+      summary: Отозвать ссылку
+      description: Повторный отзыв тоже возвращает 204.
+      responses:
+        '204':
+          description: Ссылка больше не работает
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /public/shares/{token}:
+    parameters:
+      - $ref: '#/components/parameters/ShareToken'
+    get:
+      tags: [shares]
+      operationId: getPublicShare
+      summary: Открыть файл по гостевой ссылке
+      description: |
+        Вход не нужен. Ответ содержит имя, размер и `download_url` на 5 минут.
+        Каждое обращение увеличивает счётчик `access_count`. Лимит: 60
+        запросов в минуту с одного IP.
+      security: []
+      responses:
+        '200':
+          description: Сведения о файле и ссылка на скачивание
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicShare'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '410':
+          $ref: '#/components/responses/Gone'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /uploads:
+    post:
+      tags: [uploads]
+      operationId: createUpload
+      summary: Начать или возобновить загрузку файла
+      description: |
+        Клиент заранее считает хэш содержимого (см. `content_hash`) и передаёт
+        его вместе с размером. Дальше возможны три исхода.
+
+        1. У пользователя уже есть проверенный файл с тем же хэшем: байты не
+           передаются, сервер сразу создаёт файл и отвечает 201 со статусом
+           сессии `completed`.
+        2. Есть активная сессия для той же папки, имени и хэша (например,
+           вкладку закрыли посреди загрузки): ответ 200 с этой сессией,
+           списком уже загруженных частей и ссылками на недостающие.
+        3. Иначе создаётся новая сессия: ответ 201 и ссылки на первые части.
+
+        Файл делится на части по 8 МиБ (последняя может быть меньше). Файл
+        предельного размера 50 ГиБ даёт 6400 частей, это в пределах
+        ограничения S3 в 10 000 частей. Квота проверяется с учётом других
+        активных загрузок.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UploadCreate'
+            example:
+              parent_id: ab588fc4-4b23-4bc2-8294-da3c6187c905
+              name: Запись лекции 3.mp4
+              size_bytes: 52428800
+              content_hash: 3b28d13f4f498ba98316d77dcc3064eb0e7c90837201d074733cf34425c74d51
+              mime_type: video/mp4
+      responses:
+        '201':
+          description: Создана новая сессия или файл найден среди уже загруженных
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadSession'
+        '200':
+          description: Найдена активная сессия, загрузку можно продолжить
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadSession'
+              examples:
+                resumed:
+                  $ref: '#/components/examples/ResumedUpload'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+
+  /uploads/{uploadId}:
+    parameters:
+      - $ref: '#/components/parameters/UploadId'
+    get:
+      tags: [uploads]
+      operationId: getUpload
+      summary: Состояние загрузки и свежие ссылки на части
+      description: |
+        Список загруженных частей сервер берёт из S3 (ListParts), а не из своей
+        базы, поэтому он верен даже после падения клиента. В `part_urls`
+        приходят ссылки не больше чем на 100 недостающих частей, каждая
+        действует час. Когда ссылки кончатся или истекут, клиент запрашивает
+        новые этим же вызовом.
+      responses:
+        '200':
+          description: Сессия
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadSession'
+              examples:
+                resumed:
+                  $ref: '#/components/examples/ResumedUpload'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [uploads]
+      operationId: completeUpload
+      summary: Завершить загрузку
+      description: |
+        Сервер сверяет части с данными S3, собирает объект
+        (CompleteMultipartUpload) и в одной транзакции создаёт файл со
+        статусом `verifying` и задачу на проверку хэша. Пока хэш не проверен,
+        файл виден в папке, но скачать его и поделиться им нельзя.
+        Если имя за время загрузки заняли, к нему добавляется номер: «отчёт (2).pdf».
+        Повторный вызов для завершённой сессии возвращает тот же результат с
+        кодом 200.
+      responses:
+        '201':
+          description: Файл создан и ждёт проверки
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadSession'
+        '200':
+          description: Сессия уже была завершена раньше
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadSession'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    delete:
+      tags: [uploads]
+      operationId: abortUpload
+      summary: Отменить загрузку
+      description: |
+        Прерывает multipart-загрузку в S3 и освобождает зарезервированную
+        квоту. Для уже отменённой или истёкшей сессии тоже 204, для
+        завершённой 409.
+      responses:
+        '204':
+          description: Загрузка отменена
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /changes:
+    get:
+      tags: [changes]
+      operationId: listChanges
+      summary: Лента изменений
+      description: |
+        Без `cursor` возвращает пустой список и курсор на текущий конец ленты:
+        так клиент получает точку отсчёта перед тем, как загрузить дерево.
+        С курсором возвращает события после него по возрастанию `seq`. Номера
+        идут по возрастанию, но с пропусками. События хранятся 90 дней; на
+        более старый курсор сервер ответит 410, и клиенту нужно заново
+        прочитать дерево. Открытая вкладка опрашивает ленту раз в 30 секунд.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: События
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangeList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '410':
+          $ref: '#/components/responses/Gone'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Access-токен из `POST /auth/tokens`, живёт 15 минут. Клиент держит его
+        только в памяти вкладки, в localStorage не пишет.
+    refreshCookie:
+      type: apiKey
+      in: cookie
+      name: mc_refresh
+      description: |
+        Refresh-токен: 256 случайных бит, живёт 30 дней, одноразовый. Cookie
+        HttpOnly, поэтому скрипт на странице её не прочитает.
+
+  parameters:
+    NodeId:
+      name: nodeId
+      in: path
+      required: true
+      description: UUID узла или `root`
+      schema:
+        type: string
+        pattern: '^(root|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'
+      example: 16e7dfaf-cbc1-4e53-be83-d2a58cf189cf
+    FolderId:
+      name: folderId
+      in: path
+      required: true
+      description: UUID папки, `root` или `trash`
+      schema:
+        type: string
+        pattern: '^(root|trash|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'
+      example: root
+    UploadId:
+      name: uploadId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ShareId:
+      name: shareId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ShareToken:
+      name: token
+      in: path
+      required: true
+      description: Токен из гостевой ссылки, 32 байта в base64url
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9_-]{43}$'
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Непрозрачный курсор из `next_cursor` предыдущего ответа
+      schema:
+        type: string
+        maxLength: 512
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      description: ETag узла, полученный при чтении
+      schema:
+        type: string
+      example: '"3"'
+
+  headers:
+    ETag:
+      description: Версия узла в кавычках
+      schema:
+        type: string
+      example: '"3"'
+    Location:
+      description: Адрес созданного ресурса
+      schema:
+        type: string
+      example: /api/v1/nodes/16e7dfaf-cbc1-4e53-be83-d2a58cf189cf
+    RetryAfter:
+      description: Через сколько секунд можно повторить запрос
+      schema:
+        type: integer
+      example: 30
+    NoStore:
+      description: Ответ нельзя кэшировать
+      schema:
+        type: string
+      example: no-store
+    SetRefreshCookie:
+      description: Новый refresh-токен
+      schema:
+        type: string
+      example: mc_refresh=q3N...; Path=/api/v1/auth/tokens; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict
+    ClearRefreshCookie:
+      description: Удаление cookie
+      schema:
+        type: string
+      example: mc_refresh=; Path=/api/v1/auth/tokens; Max-Age=0; HttpOnly; Secure; SameSite=Strict
+
+  responses:
+    BadRequest:
+      description: Тело запроса не разбирается
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: Нужен вход
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+          example: Bearer error="invalid_token"
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://minicloud.example/problems/unauthorized
+            title: Требуется вход
+            status: 401
+            detail: Срок действия токена истёк
+    NotFound:
+      description: Объект не найден или принадлежит другому пользователю
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: Операция противоречит текущему состоянию
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            nameConflict:
+              summary: Имя занято
+              value:
+                type: https://minicloud.example/problems/name-conflict
+                title: Имя уже занято
+                status: 409
+                detail: В папке «Отчёты» уже есть файл «ПР2.pdf»
+                existing_node_id: 16e7dfaf-cbc1-4e53-be83-d2a58cf189cf
+            uploadIncomplete:
+              summary: Не все части загружены
+              value:
+                type: https://minicloud.example/problems/upload-incomplete
+                title: Загружены не все части
+                status: 409
+                detail: Не хватает частей 5 и 7
+                missing_parts: [5, 7]
+    Gone:
+      description: Ресурс существовал, но больше недоступен
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://minicloud.example/problems/gone
+            title: Ссылка больше не действует
+            status: 410
+            detail: Срок действия ссылки истёк 06.10.2026
+    PreconditionFailed:
+      description: Узел изменился после чтения, нужно перечитать его
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    UnprocessableContent:
+      description: Ошибки в параметрах или полях запроса
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://minicloud.example/problems/validation
+            title: Некорректные данные
+            status: 422
+            errors:
+              - field: name
+                message: Имя не может содержать символ «/»
+    PreconditionRequired:
+      description: Запрос должен содержать If-Match
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    TooManyRequests:
+      description: Превышен лимит запросов
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  examples:
+    FolderNode:
+      summary: Папка
+      value:
+        id: ab588fc4-4b23-4bc2-8294-da3c6187c905
+        type: folder
+        name: Отчёты
+        parent_id: a4950eda-022a-48cf-8f0f-969caae6dd82
+        version: 1
+        created_at: '2026-09-29T10:00:00Z'
+        updated_at: '2026-09-29T10:00:00Z'
+        trashed_at: null
+        purge_after: null
+    FileNode:
+      summary: Проверенный файл
+      value:
+        id: 16e7dfaf-cbc1-4e53-be83-d2a58cf189cf
+        type: file
+        name: ПР2.pdf
+        parent_id: ab588fc4-4b23-4bc2-8294-da3c6187c905
+        version: 3
+        size_bytes: 1843200
+        mime_type: application/pdf
+        status: available
+        has_preview: true
+        created_at: '2026-09-29T10:05:00Z'
+        updated_at: '2026-09-29T10:12:00Z'
+        trashed_at: null
+        purge_after: null
+        download_url: https://s3.minicloud.example/minicloud-files/u/9ea2f4a9-5a72-49ab-98c3-ba6e7b762d19/79899000-0321-4499-b4a8-fdd7842f1824?X-Amz-Expires=300&X-Amz-Signature=...
+        download_url_expires_at: '2026-09-29T10:17:00Z'
+    ResumedUpload:
+      summary: Загрузка, прерванная на четвёртой части
+      value:
+        id: bd4550c4-df41-4e99-bff9-92752b145f54
+        status: active
+        parent_id: ab588fc4-4b23-4bc2-8294-da3c6187c905
+        name: Запись лекции 3.mp4
+        size_bytes: 52428800
+        content_hash: 3b28d13f4f498ba98316d77dcc3064eb0e7c90837201d074733cf34425c74d51
+        part_size: 8388608
+        part_count: 7
+        uploaded_parts:
+          - part_number: 1
+            size_bytes: 8388608
+          - part_number: 2
+            size_bytes: 8388608
+          - part_number: 3
+            size_bytes: 8388608
+        part_urls:
+          - part_number: 4
+            url: https://s3.minicloud.example/minicloud-files/u/9ea2f4a9-5a72-49ab-98c3-ba6e7b762d19/bd4550c4-df41-4e99-bff9-92752b145f54?partNumber=4&uploadId=...&X-Amz-Signature=...
+          - part_number: 5
+            url: https://s3.minicloud.example/minicloud-files/u/9ea2f4a9-5a72-49ab-98c3-ba6e7b762d19/bd4550c4-df41-4e99-bff9-92752b145f54?partNumber=5&uploadId=...&X-Amz-Signature=...
+          - part_number: 6
+            url: https://s3.minicloud.example/minicloud-files/u/9ea2f4a9-5a72-49ab-98c3-ba6e7b762d19/bd4550c4-df41-4e99-bff9-92752b145f54?partNumber=6&uploadId=...&X-Amz-Signature=...
+          - part_number: 7
+            url: https://s3.minicloud.example/minicloud-files/u/9ea2f4a9-5a72-49ab-98c3-ba6e7b762d19/bd4550c4-df41-4e99-bff9-92752b145f54?partNumber=7&uploadId=...&X-Amz-Signature=...
+        part_urls_expire_at: '2026-09-29T11:15:00Z'
+        created_at: '2026-09-29T10:02:00Z'
+        expires_at: '2026-10-06T10:02:00Z'
+
+  schemas:
+    Uuid:
+      type: string
+      format: uuid
+      example: 16e7dfaf-cbc1-4e53-be83-d2a58cf189cf
+    Timestamp:
+      type: string
+      format: date-time
+      example: '2026-09-29T10:15:00Z'
+    NodeName:
+      type: string
+      minLength: 1
+      maxLength: 255
+      pattern: '^[^/\u0000-\u001f]+$'
+      description: Без «/» и управляющих символов; сервер приводит строку к форме NFC
+      example: ПР2.pdf
+    ContentHash:
+      type: string
+      pattern: '^[0-9a-f]{64}$'
+      description: |
+        SHA-256 от склеенных SHA-256 блоков по 4 МиБ (схема content hash
+        Dropbox), 64 шестнадцатеричных символа. Блочная схема нужна потому, что
+        Web Crypto считает хэш только целиком, а файл в несколько гигабайт
+        целиком в память не помещается.
+      example: 3b28d13f4f498ba98316d77dcc3064eb0e7c90837201d074733cf34425c74d51
+
+    Problem:
+      type: object
+      description: Описание ошибки по RFC 9457
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          format: uri
+          example: https://minicloud.example/problems/name-conflict
+        title:
+          type: string
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+        detail:
+          type: string
+        instance:
+          type: string
+          description: Идентификатор запроса для поиска в журналах
+          example: urn:request:5f0c8e1a
+        errors:
+          type: array
+          description: Только для 422
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field:
+                type: string
+              message:
+                type: string
+        missing_parts:
+          type: array
+          description: Только для upload-incomplete
+          items:
+            type: integer
+        existing_node_id:
+          allOf:
+            - $ref: '#/components/schemas/Uuid'
+          description: Только для name-conflict
+
+    UserProfile:
+      type: object
+      required: [id, email, display_name, quota_bytes, used_bytes, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        email:
+          type: string
+          format: email
+          example: anna@example.com
+        display_name:
+          type: string
+          example: Анна
+        quota_bytes:
+          type: integer
+          format: int64
+          example: 10737418240
+        used_bytes:
+          type: integer
+          format: int64
+          description: Учитываются и файлы в корзине, пока они не удалены окончательно
+          example: 3221225472
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    PasswordTokenRequest:
+      type: object
+      required: [type, email, password]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          enum: [password]
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        password:
+          type: string
+          format: password
+          minLength: 1
+          maxLength: 1024
+    RefreshTokenRequest:
+      type: object
+      required: [type]
+      additionalProperties: false
+      description: Сам токен берётся из cookie `mc_refresh`
+      properties:
+        type:
+          type: string
+          enum: [refresh_token]
+    TokenRequest:
+      oneOf:
+        - $ref: '#/components/schemas/PasswordTokenRequest'
+        - $ref: '#/components/schemas/RefreshTokenRequest'
+      discriminator:
+        propertyName: type
+        mapping:
+          password: '#/components/schemas/PasswordTokenRequest'
+          refresh_token: '#/components/schemas/RefreshTokenRequest'
+    TokenResponse:
+      type: object
+      required: [access_token, token_type, expires_in, user]
+      properties:
+        access_token:
+          type: string
+          example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+        token_type:
+          type: string
+          enum: [Bearer]
+        expires_in:
+          type: integer
+          description: Секунды до истечения access-токена
+          example: 900
+        user:
+          $ref: '#/components/schemas/UserProfile'
+
+    Node:
+      type: object
+      required: [id, type, name, parent_id, version, created_at, updated_at, trashed_at, purge_after]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        type:
+          type: string
+          enum: [folder, file]
+        name:
+          $ref: '#/components/schemas/NodeName'
+        parent_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: У корневой папки null
+        version:
+          type: integer
+          minimum: 1
+          description: Растёт при каждом изменении; из неё строится ETag
+        size_bytes:
+          type: integer
+          format: int64
+          description: Только у файлов
+        mime_type:
+          type: string
+          description: Только у файлов
+        status:
+          type: string
+          enum: [verifying, available, corrupted]
+          description: |
+            Только у файлов. `verifying`: хэш ещё проверяется;
+            `available`: можно скачивать и делиться; `corrupted`: содержимое не
+            совпало с заявленным хэшем, файл нужно загрузить заново.
+        has_preview:
+          type: boolean
+          description: Только у файлов
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+        trashed_at:
+          type: string
+          format: date-time
+          nullable: true
+        purge_after:
+          type: string
+          format: date-time
+          nullable: true
+          description: Когда узел удалится навсегда; заполнено только у узла, который убрали в корзину явно
+        download_url:
+          type: string
+          format: uri
+          description: Только в ответе GET /nodes/{nodeId} для файла со статусом available
+        download_url_expires_at:
+          $ref: '#/components/schemas/Timestamp'
+    NodeList:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Node'
+        next_cursor:
+          type: string
+          nullable: true
+          description: null, если это последняя страница
+    FolderCreate:
+      type: object
+      required: [name]
+      additionalProperties: false
+      properties:
+        name:
+          $ref: '#/components/schemas/NodeName'
+    NodePatch:
+      type: object
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        name:
+          $ref: '#/components/schemas/NodeName'
+        parent_id:
+          type: string
+          description: UUID новой папки или `root`
+          pattern: '^(root|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'
+        trashed:
+          type: boolean
+
+    UploadCreate:
+      type: object
+      required: [parent_id, name, size_bytes, content_hash]
+      additionalProperties: false
+      properties:
+        parent_id:
+          type: string
+          description: UUID папки или `root`
+          pattern: '^(root|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'
+        name:
+          $ref: '#/components/schemas/NodeName'
+        size_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 53687091200
+          description: Не больше 50 ГиБ; чаще раньше сработает квота
+        content_hash:
+          $ref: '#/components/schemas/ContentHash'
+        mime_type:
+          type: string
+          maxLength: 255
+          example: video/mp4
+    UploadSession:
+      type: object
+      required: [id, status, parent_id, name, size_bytes, content_hash, part_size, part_count, uploaded_parts, part_urls, created_at, expires_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          type: string
+          enum: [active, completing, completed, aborted, expired]
+        parent_id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          $ref: '#/components/schemas/NodeName'
+        size_bytes:
+          type: integer
+          format: int64
+        content_hash:
+          $ref: '#/components/schemas/ContentHash'
+        part_size:
+          type: integer
+          description: Размер каждой части, кроме последней (сейчас всегда 8 МиБ)
+          example: 8388608
+        part_count:
+          type: integer
+          minimum: 0
+          maximum: 10000
+          description: 0, если передавать байты не нужно (пустой файл или файл уже есть у пользователя)
+        uploaded_parts:
+          type: array
+          description: Части, которые S3 уже принял (по данным ListParts)
+          items:
+            type: object
+            required: [part_number, size_bytes]
+            properties:
+              part_number:
+                type: integer
+                minimum: 1
+                maximum: 10000
+              size_bytes:
+                type: integer
+                format: int64
+        part_urls:
+          type: array
+          description: Подписанные ссылки для PUT недостающих частей, не больше 100 за раз
+          items:
+            $ref: '#/components/schemas/PartUrl'
+        part_urls_expire_at:
+          $ref: '#/components/schemas/Timestamp'
+        node:
+          allOf:
+            - $ref: '#/components/schemas/Node'
+          description: Созданный файл; поле есть только при status = completed
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        expires_at:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: Незавершённая сессия живёт 7 дней, потом части удаляются
+    PartUrl:
+      type: object
+      required: [part_number, url]
+      properties:
+        part_number:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        url:
+          type: string
+          format: uri
+
+    ShareCreate:
+      type: object
+      additionalProperties: false
+      properties:
+        expires_in_days:
+          type: integer
+          minimum: 1
+          maximum: 30
+          default: 7
+    Share:
+      type: object
+      required: [id, node_id, created_at, expires_at, access_count, last_accessed_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        node_id:
+          $ref: '#/components/schemas/Uuid'
+        url:
+          type: string
+          format: uri
+          description: Только в ответе на создание
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+        access_count:
+          type: integer
+          minimum: 0
+        last_accessed_at:
+          type: string
+          format: date-time
+          nullable: true
+    ShareList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Share'
+    PublicShare:
+      type: object
+      required: [name, size_bytes, mime_type, expires_at, download_url, download_url_expires_at]
+      properties:
+        name:
+          $ref: '#/components/schemas/NodeName'
+        size_bytes:
+          type: integer
+          format: int64
+        mime_type:
+          type: string
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+        download_url:
+          type: string
+          format: uri
+        download_url_expires_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    Change:
+      type: object
+      required: [seq, kind, node_id, node_name, parent_id, actor, occurred_at, details]
+      properties:
+        seq:
+          type: integer
+          format: int64
+          example: 1042
+        kind:
+          type: string
+          enum: [created, updated, trashed, restored, status_changed, purged]
+        node_id:
+          $ref: '#/components/schemas/Uuid'
+        node_name:
+          $ref: '#/components/schemas/NodeName'
+        parent_id:
+          type: string
+          format: uuid
+          nullable: true
+        actor:
+          type: string
+          enum: [user, system]
+          description: system, если изменение сделала фоновая задача (проверка хэша, очистка корзины)
+        occurred_at:
+          $ref: '#/components/schemas/Timestamp'
+        details:
+          type: object
+          additionalProperties: true
+          description: Подробности, например старое и новое имя при переименовании
+          example:
+            old_name: ПР2.pdf
+            new_name: ПР2 (финал).pdf
+    ChangeList:
+      type: object
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Change'
+        next_cursor:
+          type: string
+          description: Передать в следующий запрос; есть всегда
+        has_more:
+          type: boolean
+          description: true, если события есть и после этой страницы
