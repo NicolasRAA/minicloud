@@ -1,11 +1,18 @@
 openapi: 3.0.3
 info:
   title: Мини-облако API
-  version: 1.0.0
+  version: 1.1.0
   description: |
     Контракт между PWA-клиентом «Мини-облака» и сервером. Спецификацию пишем
     руками до кода (contract-first); сгенерированный FastAPI документ сверяется
     с этим файлом в CI.
+
+    **Версия 1.1 (ПР3, модель DDD).** Названия в контракте взяты из единого
+    языка (docs/domain/model.md): отпечаток (`fingerprint`) вместо хэша, место
+    в облаке (`cloud_space`) вместо квоты, история вместо ленты изменений.
+    Завершение загрузки отвечает 202: файл создаёт контекст «Файлы», получив
+    событие «Загрузка завершена». Клиентов у v1 ещё нет, поэтому контракт
+    меняется на месте, без /api/v2.
 
     **Общие правила**
 
@@ -22,8 +29,9 @@ info:
     * Ответы с данными пользователя приходят с `Cache-Control: no-store`.
     * Повтор любого запроса после обрыва связи безопасен: создание папки
       возвращает уже созданную папку, загрузка находится по папке, имени и
-      хэшу, завершение загрузки повторяет прежний результат, PATCH защищён
-      `If-Match`, а DELETE идемпотентен по определению.
+      отпечатку, завершение загрузки повторяет прежний ответ, PATCH защищён
+      `If-Match`, а DELETE идемпотентен по определению. Единственный возможный
+      дубль: лишняя гостевая ссылка, её видно в списке и можно отозвать.
 
     **Ошибки** приходят в формате `application/problem+json` (RFC 9457).
     Поле `type` различает причины:
@@ -37,10 +45,10 @@ info:
     | `/problems/invalid-move` | 409 | перенос папки в саму себя, изменение корня, цель в корзине |
     | `/problems/not-in-trash` | 409 | окончательно удалить можно только узел из корзины |
     | `/problems/not-shareable` | 409 | ссылку можно выдать только на проверенный файл вне корзины |
-    | `/problems/quota-exceeded` | 409 | файл не помещается в квоту |
+    | `/problems/not-enough-space` | 409 | файлу не хватает места в облаке |
     | `/problems/upload-incomplete` | 409 | загружены не все части |
-    | `/problems/upload-closed` | 409 | сессия загрузки отменена, истекла или уже завершается |
-    | `/problems/gone` | 410 | ссылка отозвана или истекла, курсор ленты устарел |
+    | `/problems/upload-closed` | 409 | загрузка отменена, просрочена или уже завершается |
+    | `/problems/gone` | 410 | ссылка отозвана или истекла, курсор истории устарел |
     | `/problems/precondition-failed` | 412 | `If-Match` не совпал с текущей версией |
     | `/problems/validation` | 422 | ошибки в полях, список в `errors` |
     | `/problems/precondition-required` | 428 | нет `If-Match` |
@@ -65,7 +73,7 @@ tags:
   - name: shares
     description: Гостевые ссылки на файлы
   - name: changes
-    description: Лента изменений для синхронизации вкладок и устройств
+    description: История изменений для синхронизации вкладок и устройств
 security:
   - bearerAuth: []
 
@@ -83,12 +91,14 @@ paths:
 
         * `type: password`: вход по email и паролю. Пароли хранятся как
           Argon2id. Не больше 5 попыток в минуту на пару «IP + email».
-        * `type: refresh_token`: обмен refresh-токена из cookie на новую пару.
-          Старый токен после обмена недействителен (ротация по RFC 9700).
-          Повтор со старым токеном в течение 30 секунд считается повтором
-          запроса (ответ потерялся или две вкладки обновились одновременно) и
-          получает новую пару. Позже сервер считает это кражей и отзывает всю
-          цепочку токенов этого входа.
+        * `type: refresh_token`: продление сеанса входа. Refresh-токен из
+          cookie обменивается на новую пару, старый после обмена недействителен
+          (ротация по RFC 9700). В сеансе действует только последний выданный
+          ключ. Повтор со старым токеном в течение 30 секунд считается повтором
+          запроса (ответ потерялся или две вкладки обновились одновременно):
+          сервер выдаёт следующий ключ цепочки, а выданный перед ним перестаёт
+          действовать. Позже сервер считает повтор кражей и завершает этот сеанс
+          входа; на других устройствах пользователь остаётся.
 
         Это не OAuth 2.0: клиент у сервера один (своя PWA), сторонних
         приложений нет.
@@ -137,8 +147,9 @@ paths:
       operationId: revokeTokens
       summary: Выйти
       description: |
-        Отзывает refresh-токен из cookie вместе со всей его цепочкой и стирает
-        cookie. Ответ всегда 204, даже если cookie нет или токен уже отозван.
+        Завершает сеанс входа, к которому относится refresh-токен из cookie,
+        и стирает cookie. На других устройствах пользователь остаётся. Ответ
+        всегда 204, даже если cookie нет или сеанс уже завершён.
         Выданный access-токен доживает свои 15 минут, поэтому клиент удаляет
         его из памяти сам.
       security:
@@ -157,7 +168,7 @@ paths:
     get:
       tags: [auth]
       operationId: getProfile
-      summary: Профиль и квота текущего пользователя
+      summary: Профиль и место в облаке текущего пользователя
       responses:
         '200':
           description: Профиль
@@ -179,6 +190,7 @@ paths:
         Обычная папка: сначала папки, потом файлы, внутри по имени без учёта
         регистра. Для `trash` возвращаются узлы, удалённые пользователем явно,
         от новых к старым; их содержимое можно открыть этим же запросом по id.
+        Узлы, которые уже удаляются навсегда, в список не попадают.
       parameters:
         - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/Limit'
@@ -253,7 +265,7 @@ paths:
       operationId: getNode
       summary: Метаданные узла и ссылка на скачивание
       description: |
-        Для проверенного файла (`status: available`) в ответе есть
+        Для проверенного файла вне корзины (`status: available`) в ответе есть
         `download_url`: подписанная ссылка на S3 со сроком 5 минут. Браузер
         скачивает файл по ней напрямую, минуя API. ETag отражает версию
         метаданных узла, ссылка на скачивание в него не входит.
@@ -283,12 +295,18 @@ paths:
       description: |
         Меняются только переданные поля.
 
-        * `trashed: true` убирает узел в корзину вместе с содержимым. Через
-          30 дней фоновая задача удалит его окончательно.
-        * `trashed: false` восстанавливает узел. Если исходная папка сама в
-          корзине или уже удалена, узел возвращается в корень, если не указан
-          `parent_id`.
-        * Перенос папки внутрь её же потомка и любые изменения корня дают 409.
+        * `trashed: true` убирает узел в корзину. Пометку получает только он
+          сам: всё, что лежит в папке, считается удалённым вместе с ней, поэтому
+          папка с любым числом файлов удаляется одной короткой транзакцией.
+          Через 30 дней фоновая задача удалит узел навсегда. Повторное
+          удаление того, что уже в корзине, ничего не меняет и отвечает 200
+          даже с устаревшим `If-Match`: результат тот же, что у первого запроса.
+        * `trashed: false` восстанавливает узел в его папку. Если эта папка сама
+          в корзине или уже удалена навсегда, узел попадает в корень, если не
+          указан `parent_id`. Если имя на месте занято, к нему добавляется номер:
+          «Отчёт (2).pdf».
+        * Перенос папки внутрь её же потомка, перенос в папку из корзины и
+          любые изменения корня дают 409.
       parameters:
         - $ref: '#/components/parameters/IfMatch'
       requestBody:
@@ -342,8 +360,13 @@ paths:
       summary: Удалить из корзины навсегда
       description: |
         Работает только для узла, который пользователь сам убрал в корзину.
-        Записи в базе удаляются сразу, объекты в S3 чистит фоновая задача.
-        Повторный DELETE вернёт 404, клиент считает это успехом.
+        Узел сразу пропадает из корзины и с других устройств (в истории
+        появляется одна запись `purged`). Поддерево большой папки стирает
+        фоновая задача порциями; место в облаке освобождается по мере
+        удаления файлов, объекты в S3 удаляются, когда на содержимое больше не
+        ссылается ни один файл. Узлы внутри папки, которые раньше удалили в
+        корзину отдельно, остаются в корзине со своим сроком. Повторный DELETE
+        вернёт 404, клиент считает это успехом.
       parameters:
         - $ref: '#/components/parameters/IfMatch'
       responses:
@@ -409,8 +432,8 @@ paths:
                 url: https://minicloud.example/s/Kr6ez18yrIhhIgUHzpP3x3pMVmxVWmdnYs-dhRAvFRg
                 created_at: '2026-09-29T10:20:00Z'
                 expires_at: '2026-10-06T10:20:00Z'
-                access_count: 0
-                last_accessed_at: null
+                open_count: 0
+                last_opened_at: null
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
@@ -445,8 +468,9 @@ paths:
       summary: Открыть файл по гостевой ссылке
       description: |
         Вход не нужен. Ответ содержит имя, размер и `download_url` на 5 минут.
-        Каждое обращение увеличивает счётчик `access_count`. Лимит: 60
-        запросов в минуту с одного IP.
+        Каждое обращение увеличивает счётчик `open_count`. Ссылка не
+        открывается, если истекла, отозвана, а также пока файл в корзине.
+        Лимит: 60 запросов в минуту с одного IP.
       security: []
       responses:
         '200':
@@ -471,21 +495,26 @@ paths:
       operationId: createUpload
       summary: Начать или возобновить загрузку файла
       description: |
-        Клиент заранее считает хэш содержимого (см. `content_hash`) и передаёт
-        его вместе с размером. Дальше возможны три исхода.
+        Клиент заранее считает отпечаток содержимого (см. `fingerprint`) и
+        передаёт его вместе с размером. Дальше возможны три исхода.
 
-        1. У пользователя уже есть проверенный файл с тем же хэшем: байты не
-           передаются, сервер сразу создаёт файл и отвечает 201 со статусом
-           сессии `completed`.
-        2. Есть активная сессия для той же папки, имени и хэша (например,
-           вкладку закрыли посреди загрузки): ответ 200 с этой сессией,
-           списком уже загруженных частей и ссылками на недостающие.
-        3. Иначе создаётся новая сессия: ответ 201 и ссылки на первые части.
+        1. Есть незавершённая загрузка для той же папки, имени и отпечатка
+           (например, вкладку закрыли посреди загрузки): ответ 200 с ней,
+           списком уже принятых частей и ссылками на недостающие.
+        2. У пользователя уже есть проверенное содержимое с тем же отпечатком
+           (дубликат): байты не передаются, загрузка сразу завершается, ответ
+           201 со статусом `completed`. Файл появится в папке уже проверенным.
+        3. Иначе начинается новая загрузка: ответ 201 и ссылки на первые части.
+
+        Во втором и третьем случае сервер сначала резервирует под файл место в
+        облаке; дубликат занимает место так же, как обычный файл. Если места не
+        хватает с учётом других незавершённых загрузок, ответ 409
+        `not-enough-space` и загрузка не начинается. ID будущего файла
+        (`file_id`) известен с первого ответа.
 
         Файл делится на части по 8 МиБ (последняя может быть меньше). Файл
         предельного размера 50 ГиБ даёт 6400 частей, это в пределах
-        ограничения S3 в 10 000 частей. Квота проверяется с учётом других
-        активных загрузок.
+        ограничения S3 в 10 000 частей.
       requestBody:
         required: true
         content:
@@ -496,11 +525,12 @@ paths:
               parent_id: ab588fc4-4b23-4bc2-8294-da3c6187c905
               name: Запись лекции 3.mp4
               size_bytes: 52428800
-              content_hash: 3b28d13f4f498ba98316d77dcc3064eb0e7c90837201d074733cf34425c74d51
+              fingerprint: 3b28d13f4f498ba98316d77dcc3064eb0e7c90837201d074733cf34425c74d51
               mime_type: video/mp4
+              device_modified_at: '2026-09-28T18:40:00Z'
       responses:
         '201':
-          description: Создана новая сессия или файл найден среди уже загруженных
+          description: Начата новая загрузка или найден дубликат (загрузка сразу завершена)
           headers:
             Location:
               $ref: '#/components/headers/Location'
@@ -509,7 +539,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/UploadSession'
         '200':
-          description: Найдена активная сессия, загрузку можно продолжить
+          description: Найдена незавершённая загрузка, её можно докачать
           content:
             application/json:
               schema:
@@ -558,25 +588,26 @@ paths:
       operationId: completeUpload
       summary: Завершить загрузку
       description: |
-        Сервер сверяет части с данными S3, собирает объект
-        (CompleteMultipartUpload) и в одной транзакции создаёт файл со
-        статусом `verifying` и задачу на проверку хэша. Пока хэш не проверен,
-        файл виден в папке, но скачать его и поделиться им нельзя.
-        Если имя за время загрузки заняли, к нему добавляется номер: «отчёт (2).pdf».
-        Повторный вызов для завершённой сессии возвращает тот же результат с
-        кодом 200.
+        Сервер сверяет части с данными S3 и собирает объект
+        (CompleteMultipartUpload). Загрузка завершается своей транзакцией и
+        той же транзакцией записывает событие «Загрузка завершена» в журнал.
+        Файл создаёт не этот запрос, а контекст «Файлы», получив событие:
+        обычно через доли секунды файл появляется в папке со статусом
+        `verifying`. Поэтому ответ 202, а `Location` указывает на будущий файл
+        `file_id`; пока событие не обработано, `GET /nodes/{file_id}` отвечает
+        404, и клиент показывает файл по данным загрузки.
+
+        Пока отпечаток не проверен, файл виден в папке, но скачать его и
+        поделиться им нельзя. Если имя за время загрузки заняли, к нему
+        добавляется номер: «отчёт (2).pdf»; если папку назначения удалили,
+        файл попадает в корень. Повторный вызов для завершённой загрузки
+        возвращает тот же ответ.
       responses:
-        '201':
-          description: Файл создан и ждёт проверки
+        '202':
+          description: Загрузка завершена, файл появится в папке после обработки события
           headers:
             Location:
               $ref: '#/components/headers/Location'
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/UploadSession'
-        '200':
-          description: Сессия уже была завершена раньше
           content:
             application/json:
               schema:
@@ -592,8 +623,8 @@ paths:
       operationId: abortUpload
       summary: Отменить загрузку
       description: |
-        Прерывает multipart-загрузку в S3 и освобождает зарезервированную
-        квоту. Для уже отменённой или истёкшей сессии тоже 204, для
+        Прерывает multipart-загрузку в S3 и снимает резерв места в облаке.
+        Для уже отменённой или просроченной загрузки тоже 204, для
         завершённой 409.
       responses:
         '204':
@@ -609,14 +640,18 @@ paths:
     get:
       tags: [changes]
       operationId: listChanges
-      summary: Лента изменений
+      summary: История изменений
       description: |
-        Без `cursor` возвращает пустой список и курсор на текущий конец ленты:
-        так клиент получает точку отсчёта перед тем, как загрузить дерево.
-        С курсором возвращает события после него по возрастанию `seq`. Номера
-        идут по возрастанию, но с пропусками. События хранятся 90 дней; на
-        более старый курсор сервер ответит 410, и клиенту нужно заново
-        прочитать дерево. Открытая вкладка опрашивает ленту раз в 30 секунд.
+        Без `cursor` возвращает пустой список и курсор на текущий конец
+        истории: так клиент получает точку отсчёта перед тем, как загрузить
+        дерево. С курсором возвращает записи после него по возрастанию `seq`.
+        У каждого пользователя номера идут подряд, без пропусков и в порядке
+        фиксации изменений: номер выдаёт счётчик владельца, который держится
+        до конца транзакции. Пропущенный номер означает ошибку, а не задержку.
+        Удаление папки даёт одну запись на папку, а не на каждый файл внутри.
+        Записи хранятся 90 дней; если записей после курсора уже нет, сервер
+        ответит 410, и клиенту нужно заново прочитать дерево. Открытая вкладка
+        опрашивает историю раз в 30 секунд.
       parameters:
         - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/Limit'
@@ -794,6 +829,15 @@ components:
                 status: 409
                 detail: В папке «Отчёты» уже есть файл «ПР2.pdf»
                 existing_node_id: 16e7dfaf-cbc1-4e53-be83-d2a58cf189cf
+            notEnoughSpace:
+              summary: Не хватает места в облаке
+              value:
+                type: https://minicloud.example/problems/not-enough-space
+                title: Не хватает места в облаке
+                status: 409
+                detail: Файлу нужно 3,2 ГБ, свободно 1,1 ГБ. Освободите место или очистите корзину
+                required_bytes: 3435973837
+                free_bytes: 1181116006
             uploadIncomplete:
               summary: Не все части загружены
               value:
@@ -873,6 +917,7 @@ components:
         mime_type: application/pdf
         status: available
         has_preview: true
+        device_modified_at: '2026-09-28T21:47:00Z'
         created_at: '2026-09-29T10:05:00Z'
         updated_at: '2026-09-29T10:12:00Z'
         trashed_at: null
@@ -884,10 +929,11 @@ components:
       value:
         id: bd4550c4-df41-4e99-bff9-92752b145f54
         status: active
+        file_id: 5d0f1b6e-7a3c-4f1e-9b2d-0c8e4a6f2b91
         parent_id: ab588fc4-4b23-4bc2-8294-da3c6187c905
         name: Запись лекции 3.mp4
         size_bytes: 52428800
-        content_hash: 3b28d13f4f498ba98316d77dcc3064eb0e7c90837201d074733cf34425c74d51
+        fingerprint: 3b28d13f4f498ba98316d77dcc3064eb0e7c90837201d074733cf34425c74d51
         part_size: 8388608
         part_count: 7
         uploaded_parts:
@@ -926,12 +972,14 @@ components:
       pattern: '^[^/\u0000-\u001f]+$'
       description: Без «/» и управляющих символов; сервер приводит строку к форме NFC
       example: ПР2.pdf
-    ContentHash:
+    Fingerprint:
       type: string
       pattern: '^[0-9a-f]{64}$'
       description: |
-        SHA-256 от склеенных SHA-256 блоков по 4 МиБ (схема content hash
-        Dropbox), 64 шестнадцатеричных символа. Блочная схема нужна потому, что
+        Отпечаток содержимого: SHA-256 от склеенных SHA-256 блоков по 4 МиБ
+        (схема content hash Dropbox), 64 шестнадцатеричных символа. Совпали
+        отпечатки, значит, совпало содержимое: по отпечатку узнают дубликат и
+        проверяют, не испортился ли файл. Блочная схема нужна потому, что
         Web Crypto считает хэш только целиком, а файл в несколько гигабайт
         целиком в память не помещается.
       example: 3b28d13f4f498ba98316d77dcc3064eb0e7c90837201d074733cf34425c74d51
@@ -973,6 +1021,14 @@ components:
           description: Только для upload-incomplete
           items:
             type: integer
+        required_bytes:
+          type: integer
+          format: int64
+          description: Только для not-enough-space, сколько нужно файлу
+        free_bytes:
+          type: integer
+          format: int64
+          description: Только для not-enough-space, сколько свободно с учётом резервов
         existing_node_id:
           allOf:
             - $ref: '#/components/schemas/Uuid'
@@ -980,7 +1036,7 @@ components:
 
     UserProfile:
       type: object
-      required: [id, email, display_name, quota_bytes, used_bytes, created_at]
+      required: [id, email, display_name, cloud_space, created_at]
       properties:
         id:
           $ref: '#/components/schemas/Uuid'
@@ -991,17 +1047,36 @@ components:
         display_name:
           type: string
           example: Анна
-        quota_bytes:
+        cloud_space:
+          $ref: '#/components/schemas/CloudSpace'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+    CloudSpace:
+      type: object
+      description: |
+        Место в облаке. Свободно: allocated_bytes − used_bytes − reserved_bytes.
+        Если администратор уменьшил место ниже занятого, файлы остаются, но
+        новые загрузки не начнутся.
+      required: [allocated_bytes, used_bytes, reserved_bytes]
+      properties:
+        allocated_bytes:
           type: integer
           format: int64
+          description: Сколько выделил администратор
           example: 10737418240
         used_bytes:
           type: integer
           format: int64
-          description: Учитываются и файлы в корзине, пока они не удалены окончательно
+          description: |
+            Занято файлами, включая корзину и дубликаты: каждый файл считается
+            по своему размеру, пока его не удалили навсегда. Повреждённые
+            файлы места не занимают.
           example: 3221225472
-        created_at:
-          $ref: '#/components/schemas/Timestamp'
+        reserved_bytes:
+          type: integer
+          format: int64
+          description: Зарезервировано под незавершённые загрузки
+          example: 52428800
 
     PasswordTokenRequest:
       type: object
@@ -1086,12 +1161,19 @@ components:
           type: string
           enum: [verifying, available, corrupted]
           description: |
-            Только у файлов. `verifying`: хэш ещё проверяется;
+            Только у файлов. `verifying`: отпечаток ещё проверяется;
             `available`: можно скачивать и делиться; `corrupted`: содержимое не
-            совпало с заявленным хэшем, файл нужно загрузить заново.
+            совпало с отпечатком, файл нужно загрузить заново.
         has_preview:
           type: boolean
           description: Только у файлов
+        device_modified_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            Только у файлов: когда файл изменён на устройстве (по данным
+            браузера). Дата загрузки в облако хранится в `created_at`.
         created_at:
           $ref: '#/components/schemas/Timestamp'
         updated_at:
@@ -1100,6 +1182,10 @@ components:
           type: string
           format: date-time
           nullable: true
+          description: |
+            Заполнено только у узла, который убрали в корзину явно. Узел внутри
+            такой папки сам этого поля не получает, но тоже считается
+            удалённым, пока папка в корзине.
         purge_after:
           type: string
           format: date-time
@@ -1108,7 +1194,7 @@ components:
         download_url:
           type: string
           format: uri
-          description: Только в ответе GET /nodes/{nodeId} для файла со статусом available
+          description: Только в ответе GET /nodes/{nodeId} для файла со статусом available вне корзины
         download_url_expires_at:
           $ref: '#/components/schemas/Timestamp'
     NodeList:
@@ -1146,7 +1232,7 @@ components:
 
     UploadCreate:
       type: object
-      required: [parent_id, name, size_bytes, content_hash]
+      required: [parent_id, name, size_bytes, fingerprint]
       additionalProperties: false
       properties:
         parent_id:
@@ -1161,21 +1247,32 @@ components:
           minimum: 0
           maximum: 53687091200
           description: Не больше 50 ГиБ; чаще раньше сработает квота
-        content_hash:
-          $ref: '#/components/schemas/ContentHash'
+        fingerprint:
+          $ref: '#/components/schemas/Fingerprint'
         mime_type:
           type: string
           maxLength: 255
           example: video/mp4
+        device_modified_at:
+          type: string
+          format: date-time
+          description: Когда файл изменён на устройстве (File.lastModified)
     UploadSession:
       type: object
-      required: [id, status, parent_id, name, size_bytes, content_hash, part_size, part_count, uploaded_parts, part_urls, created_at, expires_at]
+      required: [id, status, file_id, parent_id, name, size_bytes, fingerprint, part_size, part_count, uploaded_parts, part_urls, created_at, expires_at]
       properties:
         id:
           $ref: '#/components/schemas/Uuid'
         status:
           type: string
           enum: [active, completing, completed, aborted, expired]
+        file_id:
+          allOf:
+            - $ref: '#/components/schemas/Uuid'
+          description: |
+            ID будущего файла. Известен с первого ответа; файл с этим ID
+            появляется в папке после завершения загрузки и обработки события.
+            Одна загрузка даёт один файл.
         parent_id:
           $ref: '#/components/schemas/Uuid'
         name:
@@ -1183,8 +1280,8 @@ components:
         size_bytes:
           type: integer
           format: int64
-        content_hash:
-          $ref: '#/components/schemas/ContentHash'
+        fingerprint:
+          $ref: '#/components/schemas/Fingerprint'
         part_size:
           type: integer
           description: Размер каждой части, кроме последней (сейчас всегда 8 МиБ)
@@ -1193,7 +1290,7 @@ components:
           type: integer
           minimum: 0
           maximum: 10000
-          description: 0, если передавать байты не нужно (пустой файл или файл уже есть у пользователя)
+          description: 0, если передавать байты не нужно (пустой файл или дубликат)
         uploaded_parts:
           type: array
           description: Части, которые S3 уже принял (по данным ListParts)
@@ -1215,16 +1312,12 @@ components:
             $ref: '#/components/schemas/PartUrl'
         part_urls_expire_at:
           $ref: '#/components/schemas/Timestamp'
-        node:
-          allOf:
-            - $ref: '#/components/schemas/Node'
-          description: Созданный файл; поле есть только при status = completed
         created_at:
           $ref: '#/components/schemas/Timestamp'
         expires_at:
           allOf:
             - $ref: '#/components/schemas/Timestamp'
-          description: Незавершённая сессия живёт 7 дней, потом части удаляются
+          description: Незавершённая загрузка живёт 7 дней, потом части удаляются и резерв места снимается
     PartUrl:
       type: object
       required: [part_number, url]
@@ -1248,7 +1341,7 @@ components:
           default: 7
     Share:
       type: object
-      required: [id, node_id, created_at, expires_at, access_count, last_accessed_at]
+      required: [id, node_id, created_at, expires_at, open_count, last_opened_at]
       properties:
         id:
           $ref: '#/components/schemas/Uuid'
@@ -1262,10 +1355,11 @@ components:
           $ref: '#/components/schemas/Timestamp'
         expires_at:
           $ref: '#/components/schemas/Timestamp'
-        access_count:
+        open_count:
           type: integer
           minimum: 0
-        last_accessed_at:
+          description: Сколько раз ссылку открыли
+        last_opened_at:
           type: string
           format: date-time
           nullable: true
@@ -1298,17 +1392,28 @@ components:
 
     Change:
       type: object
-      required: [seq, kind, node_id, node_name, parent_id, actor, occurred_at, details]
+      description: Запись истории
+      required: [seq, kind, node_id, node_type, node_name, parent_id, actor, occurred_at, details]
       properties:
         seq:
           type: integer
           format: int64
+          description: Номер записи в истории пользователя; номера идут подряд, без пропусков
           example: 1042
         kind:
           type: string
-          enum: [created, updated, trashed, restored, status_changed, purged]
+          enum: [added, available, corrupted, renamed, moved, trashed, restored, purged, preview_ready]
+          description: |
+            `added`: файл загружен или папка создана; `available`: файл
+            проверен и доступен; `corrupted`: файл повреждён при загрузке;
+            `renamed`, `moved`; `trashed`: удалён в корзину; `restored`:
+            восстановлен; `purged`: удалён навсегда (для папки одна запись на
+            всё поддерево); `preview_ready`: у файла появилось превью.
         node_id:
           $ref: '#/components/schemas/Uuid'
+        node_type:
+          type: string
+          enum: [folder, file]
         node_name:
           $ref: '#/components/schemas/NodeName'
         parent_id:
@@ -1318,7 +1423,7 @@ components:
         actor:
           type: string
           enum: [user, system]
-          description: system, если изменение сделала фоновая задача (проверка хэша, очистка корзины)
+          description: system, если изменение сделала фоновая задача (проверка отпечатка, очистка корзины)
         occurred_at:
           $ref: '#/components/schemas/Timestamp'
         details:
