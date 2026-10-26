@@ -1,4 +1,4 @@
-// «Мини-облако»: логическая модель данных для dbdiagram.io, версия 2 (ПР3, модель DDD).
+// «Мини-облако»: логическая модель данных для dbdiagram.io, версия 3 (ПР4, конкурентный доступ).
 // Источник истины: schema.sql. Частичные индексы и CHECK-ограничения
 // в DBML выражаются не полностью, их условия приведены в примечаниях.
 // Таблицы сгруппированы по ограниченным контекстам: одна схема PostgreSQL на контекст.
@@ -7,7 +7,7 @@
 
 Project minicloud {
   database_type: 'PostgreSQL'
-  Note: 'Модель данных после ПР3: схемы auth, files, uploads, content, shares и журнал событий events. Физическая схема: schema.sql'
+  Note: 'Модель данных после ПР4: схемы auth, files, uploads, content, shares и журнал событий events. Физическая схема: schema.sql'
 }
 
 // ---------------- Вход ----------------
@@ -60,20 +60,21 @@ Table files.cloud_spaces {
   allocated_bytes bigint [not null, default: 10737418240, note: '10 ГиБ по умолчанию']
   used_bytes bigint [not null, default: 0, note: 'файлы, включая корзину и дубликаты']
   reserved_bytes bigint [not null, default: 0, note: 'резерв под незавершённые загрузки']
-  Note: 'Место в облаке. CHECK: used + reserved <= allocated, либо reserved = 0'
+  Note: 'Место в облаке, корень агрегата; блокируется FOR UPDATE. CHECK: used + reserved <= allocated, либо reserved = 0'
 }
 
-Table files.space_reservations {
-  file_id uuid [pk, note: 'ID будущего файла; по ID, без внешнего ключа']
+Table files.space_entries {
+  file_id uuid [pk, note: 'ID файла, выданный при старте загрузки; по ID, без внешнего ключа']
   owner_id uuid [not null]
   bytes bigint [not null]
+  state text [not null, note: "'reserved' или 'used'"]
   created_at timestamptz [not null, default: `now()`]
-  expires_at timestamptz [not null, note: '10 минут до начала загрузки, затем срок загрузки']
+  expires_at timestamptz [note: 'у резерва срок загрузки (7 дней), у занятого места NULL']
   Indexes {
-    owner_id [name: 'space_reservations_owner_idx']
-    expires_at [name: 'space_reservations_expiry_idx']
+    (owner_id, state) [name: 'space_entries_owner_idx']
+    expires_at [name: 'space_entries_expiry_idx', note: 'WHERE state = reserved']
   }
-  Note: 'Резервы места под загружаемые файлы'
+  Note: 'Строки места в облаке: байты каждого файла, резерв или занятое место. Счётчики cloud_spaces равны их суммам'
 }
 
 Table files.nodes {
@@ -241,7 +242,7 @@ TableGroup "Вход" {
 
 TableGroup "Файлы" {
   files.cloud_spaces
-  files.space_reservations
+  files.space_entries
   files.nodes
   files.history_counters
   files.history
@@ -267,7 +268,7 @@ TableGroup "Журнал событий" {
 // Внутри контекстов.
 Ref: auth.signin_sessions.account_id > auth.accounts.id [delete: cascade]
 Ref: auth.refresh_keys.session_id > auth.signin_sessions.id [delete: cascade]
-Ref: files.space_reservations.owner_id > files.cloud_spaces.owner_id [delete: cascade]
+Ref: files.space_entries.owner_id > files.cloud_spaces.owner_id [delete: cascade]
 Ref: files.nodes.(parent_id, owner_id, parent_type) > files.nodes.(id, owner_id, type)
 Ref: files.history.owner_id > files.history_counters.owner_id [delete: cascade]
 Ref: content.content_files.(content_id, owner_id) > content.contents.(id, owner_id)

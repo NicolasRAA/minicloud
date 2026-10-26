@@ -1,8 +1,17 @@
--- «Мини-облако»: физическая модель данных, версия 2 (ПР3, модель DDD).
+-- «Мини-облако»: физическая модель данных, версия 3 (ПР4, конкурентный доступ).
 -- Целевая СУБД PostgreSQL 18; скрипт проверен на PostgreSQL 16.15 и 18.4.
 -- По этому файлу построены er-diagram.dbml и er-diagram.png,
--- ограничения проверяет schema-checks.sql. Правила моделей описаны
--- в docs/domain/model.md, решение о переходе на версию 2 записано в ADR-002.md.
+-- ограничения проверяет schema-checks.sql, гонки воспроизводит race-demo.py.
+-- Правила моделей описаны в docs/domain/model.md. Переход на версию 2 записан
+-- в ADR-002.md, на версию 3 в ADR-003.md.
+--
+-- Уровень изоляции везде READ COMMITTED (по умолчанию в PostgreSQL).
+-- Гонки закрываются явными блокировками там, где это написано в комментариях
+-- к таблицам: «пессимистичная» значит SELECT ... FOR UPDATE на строке корня
+-- агрегата в начале транзакции, «оптимистичная» значит UPDATE ... WHERE version = $n.
+-- Обращения к S3 выполняются вне транзакций, поэтому блокировки держатся миллисекунды.
+-- Если транзакции нужно несколько строк, порядок такой: счётчик истории владельца,
+-- корень агрегата, строки агрегата (ADR-003, решение 11).
 --
 -- Каждый ограниченный контекст хранит данные в своей схеме:
 --   auth     Вход                 учётные записи, сеансы входа, ключи продления
@@ -81,6 +90,12 @@ CREATE SCHEMA files;
 
 -- Место в облаке: сколько выделил администратор, сколько занято файлами
 -- (вместе с корзиной и дубликатами) и сколько зарезервировано под незавершённые загрузки.
+-- Это корень агрегата. Счётчики used_bytes и reserved_bytes равны суммам строк
+-- files.space_entries владельца и меняются той же транзакцией, что и строки.
+-- Пессимистичная блокировка: любая операция с местом начинается с
+--   SELECT ... FROM files.cloud_spaces WHERE owner_id = $1 FOR UPDATE
+-- Без неё две загрузки читают одно и то же «свободно» и вместе выходят за
+-- выделенное (потерянное обновление, гонка 1 в race-demo.py).
 CREATE TABLE files.cloud_spaces (
     owner_id        uuid   PRIMARY KEY REFERENCES auth.accounts (id) ON DELETE CASCADE,
     allocated_bytes bigint NOT NULL DEFAULT 10737418240 CHECK (allocated_bytes >= 0),   -- 10 ГиБ
@@ -92,20 +107,29 @@ CREATE TABLE files.cloud_spaces (
     CONSTRAINT cloud_spaces_fits CHECK (used_bytes + reserved_bytes <= allocated_bytes OR reserved_bytes = 0)
 );
 
--- Резерв места под файл, который ещё загружается. Ключ: ID будущего файла,
--- его выдаёт команда «загрузить». Пока загрузка не начата, резерв живёт 10 минут;
--- событие UploadStarted продлевает его до срока загрузки. Просроченные резервы
--- снимает фоновая задача.
-CREATE TABLE files.space_reservations (
+-- Строки места в облаке: сколько байтов приходится на каждый файл.
+-- Ключ: ID файла, его выдаёт команда «загрузить». Строка проходит путь
+-- «зарезервировано» → «занято» и исчезает, когда место освобождается.
+-- Построчный учёт делает операции идемпотентными: повторный резерв того же файла
+-- упирается в первичный ключ, повторное «занять» не находит резерва, повторное
+-- «освободить» не находит строки и ничего не вычитает. Поэтому событие, пришедшее
+-- дважды, не меняет счётчики дважды.
+-- Срок резерва равен сроку загрузки (7 дней) и ставится сразу при резерве,
+-- а не продлевается событием: отставание очереди не снимет резерв у идущей загрузки.
+-- Резерв, под который загрузка так и не создалась, фоновая задача снимает через
+-- 10 минут, спросив «Загрузку» через её публичный интерфейс.
+CREATE TABLE files.space_entries (
     file_id    uuid        PRIMARY KEY,
     owner_id   uuid        NOT NULL REFERENCES files.cloud_spaces (owner_id) ON DELETE CASCADE,
     bytes      bigint      NOT NULL CHECK (bytes >= 0),
+    state      text        NOT NULL CHECK (state IN ('reserved', 'used')),
     created_at timestamptz NOT NULL DEFAULT now(),
-    expires_at timestamptz NOT NULL,
-    CONSTRAINT space_reservations_term CHECK (expires_at > created_at)
+    expires_at timestamptz,                                 -- у резерва срок загрузки, у занятого места срока нет
+    CONSTRAINT space_entries_term CHECK ((state = 'reserved') = (expires_at IS NOT NULL)),
+    CONSTRAINT space_entries_term_after_start CHECK (expires_at > created_at)
 );
-CREATE INDEX space_reservations_owner_idx  ON files.space_reservations (owner_id);
-CREATE INDEX space_reservations_expiry_idx ON files.space_reservations (expires_at);
+CREATE INDEX space_entries_owner_idx  ON files.space_entries (owner_id, state);
+CREATE INDEX space_entries_expiry_idx ON files.space_entries (expires_at) WHERE state = 'reserved';
 
 -- Папки и файлы.
 -- Корзина: пометку получает только узел, который удалили явно (trashed_at и purge_after).
@@ -113,6 +137,10 @@ CREATE INDEX space_reservations_expiry_idx ON files.space_reservations (expires_
 -- не получает, поэтому удаление папки с любым числом файлов меняет одну строку.
 -- «Удалить навсегда» ставит purging_since; поддерево стирает фоновая задача
 -- порциями снизу вверх, публикуя FilePurged для каждого файла.
+-- Оптимистичная блокировка: любое изменение узла выполняется одной командой
+--   UPDATE files.nodes SET ..., version = version + 1 WHERE id = $1 AND version = $2
+-- где $2 пришла в If-Match. Ноль изменённых строк значит, что узел успели изменить
+-- на другом устройстве: API отвечает 412 и отдаёт текущую версию (гонка 3 в race-demo.py).
 CREATE TABLE files.nodes (
     id                 uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
     owner_id           uuid        NOT NULL REFERENCES auth.accounts (id) ON DELETE CASCADE,
@@ -131,7 +159,7 @@ CREATE TABLE files.nodes (
     has_preview        boolean     NOT NULL DEFAULT false,
     device_modified_at timestamptz,                         -- «изменён на устройстве»; «загружен» это created_at
     -- У всех узлов.
-    version            integer     NOT NULL DEFAULT 1 CHECK (version > 0),   -- основа ETag
+    version            integer     NOT NULL DEFAULT 1 CHECK (version > 0),   -- ETag; оптимистичная блокировка
     trashed_at         timestamptz,
     purge_after        timestamptz,                         -- trashed_at + 30 дней
     purging_since      timestamptz,                         -- когда началось удаление навсегда
@@ -255,6 +283,16 @@ CREATE INDEX uploads_owner_idx  ON uploads.uploads (owner_id, created_at DESC);
 -- Содержимое это байты файла. Одно содержимое хранит байты всех файлов-дубликатов
 -- одного владельца. «Файлы» о содержимом не знают: связь «файл → содержимое»
 -- хранится здесь.
+--
+-- Пессимистичная блокировка строки содержимого. Две операции меняют число
+-- файлов, которые ссылаются на содержимое, и обе начинаются с SELECT ... FOR UPDATE
+-- на строке content.contents:
+--   «привязать дубликат» (связь С6): найти проверенное содержимое по отпечатку,
+--     заблокировать его и сразу записать связь с ID будущего файла;
+--   «отвязать файл» (подписчик FilePurged): заблокировать содержимое, удалить связь
+--     и удалить содержимое, только если связей не осталось.
+-- Без блокировки дубликат мог сослаться на содержимое, которое в тот же момент
+-- удалялось, и файл оказывался доступным без байтов (гонка 2 в race-demo.py).
 -- =====================================================================
 CREATE SCHEMA content;
 

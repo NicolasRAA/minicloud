@@ -1,4 +1,4 @@
--- Проверка ограничений из schema.sql (версия 2) на живой базе.
+-- Проверка ограничений из schema.sql (версия 3) на живой базе.
 -- Запуск на пустой базе:
 --   psql -v ON_ERROR_STOP=1 -f schema.sql -f schema-checks.sql
 -- Вызовы оформлены процедурами (CALL), чтобы psql печатал только итоги.
@@ -157,35 +157,71 @@ CALL pg_temp.expect_ok('Сеанс входа И2: повтор старого �
 
 -- =====================================================================
 -- Файлы: место в облаке
+-- Операции агрегата записаны так, как их выполняет корень, в порядке из ADR-003
+-- (решение 11): сначала строка места FOR UPDATE, потом строка файла в space_entries
+-- и счётчики.
+-- Одновременные резервы проверяет race-demo.py, здесь только ограничения.
 -- =====================================================================
-CALL pg_temp.expect_ok('Место в облаке: резерв 6 ГиБ из 10',
-    $q$INSERT INTO files.space_reservations (file_id, owner_id, bytes, expires_at)
-       VALUES ('00000000-0000-0000-0000-0000000000aa', '00000000-0000-0000-0000-00000000000a', 6442450944,
-               now() + interval '10 minutes');
-       UPDATE files.cloud_spaces SET reserved_bytes = reserved_bytes + 6442450944
-       WHERE owner_id = '00000000-0000-0000-0000-00000000000a'$q$);
+CALL pg_temp.expect_ok('Место в облаке: резерв 6 ГиБ из 10 под будущий файл',
+    $q$SELECT 1 FROM files.cloud_spaces WHERE owner_id = '00000000-0000-0000-0000-00000000000a' FOR UPDATE;
+       INSERT INTO files.space_entries (file_id, owner_id, bytes, state, expires_at)
+       VALUES ('00000000-0000-0000-0000-0000000000aa', '00000000-0000-0000-0000-00000000000a', 6442450944, 'reserved', now() + interval '7 days');
+       UPDATE files.cloud_spaces SET reserved_bytes = reserved_bytes + 6442450944 WHERE owner_id = '00000000-0000-0000-0000-00000000000a'$q$);
+CALL pg_temp.expect_fail('Место в облаке: повторный резерв того же файла не удвоит место',
+    $q$INSERT INTO files.space_entries (file_id, owner_id, bytes, state, expires_at)
+       VALUES ('00000000-0000-0000-0000-0000000000aa', '00000000-0000-0000-0000-00000000000a', 6442450944, 'reserved', now() + interval '7 days')$q$, '23505');
+CALL pg_temp.expect_fail('Место в облаке: у резерва есть срок, равный сроку загрузки',
+    $q$INSERT INTO files.space_entries (file_id, owner_id, bytes, state)
+       VALUES (gen_random_uuid(), '00000000-0000-0000-0000-00000000000a', 1024, 'reserved')$q$, '23514');
+CALL pg_temp.expect_fail('Место в облаке: у занятого места срока нет',
+    $q$INSERT INTO files.space_entries (file_id, owner_id, bytes, state, expires_at)
+       VALUES (gen_random_uuid(), '00000000-0000-0000-0000-00000000000a', 1024, 'used', now() + interval '7 days')$q$, '23514');
 CALL pg_temp.expect_fail('Место в облаке: занятое и зарезервированное не больше выделенного',
-    $q$INSERT INTO files.space_reservations (file_id, owner_id, bytes, expires_at)
-       VALUES ('00000000-0000-0000-0000-0000000000ab', '00000000-0000-0000-0000-00000000000a', 5368709120,
-               now() + interval '10 minutes');
-       UPDATE files.cloud_spaces SET reserved_bytes = reserved_bytes + 5368709120
-       WHERE owner_id = '00000000-0000-0000-0000-00000000000a'$q$, '23514');
+    $q$INSERT INTO files.space_entries (file_id, owner_id, bytes, state, expires_at)
+       VALUES ('00000000-0000-0000-0000-0000000000ab', '00000000-0000-0000-0000-00000000000a', 5368709120, 'reserved', now() + interval '7 days');
+       UPDATE files.cloud_spaces SET reserved_bytes = reserved_bytes + 5368709120 WHERE owner_id = '00000000-0000-0000-0000-00000000000a'$q$, '23514');
 CALL pg_temp.expect_ok('Место в облаке: файл стал доступен, резерв стал занятым местом',
-    $q$WITH r AS (DELETE FROM files.space_reservations
-                  WHERE file_id = '00000000-0000-0000-0000-0000000000aa' RETURNING owner_id, bytes)
-       UPDATE files.cloud_spaces s SET used_bytes = s.used_bytes + r.bytes, reserved_bytes = s.reserved_bytes - r.bytes
-       FROM r WHERE s.owner_id = r.owner_id$q$,
-    $q$(SELECT used_bytes = 6442450944 AND reserved_bytes = 0 FROM files.cloud_spaces
-        WHERE owner_id = '00000000-0000-0000-0000-00000000000a')$q$);
+    $q$SELECT 1 FROM files.cloud_spaces WHERE owner_id = '00000000-0000-0000-0000-00000000000a' FOR UPDATE;
+       WITH e AS (UPDATE files.space_entries SET state = 'used', expires_at = NULL
+                  WHERE file_id = '00000000-0000-0000-0000-0000000000aa' AND state = 'reserved'
+                  RETURNING owner_id, bytes)
+       UPDATE files.cloud_spaces s SET used_bytes = s.used_bytes + e.bytes, reserved_bytes = s.reserved_bytes - e.bytes
+       FROM e WHERE s.owner_id = e.owner_id$q$,
+    $q$(SELECT used_bytes = 6442450944 AND reserved_bytes = 0 FROM files.cloud_spaces WHERE owner_id = '00000000-0000-0000-0000-00000000000a')$q$);
+CALL pg_temp.expect_ok('Место в облаке: повторное «занять» ничего не меняет',
+    $q$SELECT 1 FROM files.cloud_spaces WHERE owner_id = '00000000-0000-0000-0000-00000000000a' FOR UPDATE;
+       WITH e AS (UPDATE files.space_entries SET state = 'used', expires_at = NULL
+                  WHERE file_id = '00000000-0000-0000-0000-0000000000aa' AND state = 'reserved'
+                  RETURNING owner_id, bytes)
+       UPDATE files.cloud_spaces s SET used_bytes = s.used_bytes + e.bytes, reserved_bytes = s.reserved_bytes - e.bytes
+       FROM e WHERE s.owner_id = e.owner_id$q$,
+    $q$(SELECT used_bytes = 6442450944 AND reserved_bytes = 0 FROM files.cloud_spaces WHERE owner_id = '00000000-0000-0000-0000-00000000000a')$q$);
 CALL pg_temp.expect_ok('Место в облаке: администратор уменьшил место ниже занятого, файлы остались',
-    $q$UPDATE files.cloud_spaces SET allocated_bytes = 5368709120
-       WHERE owner_id = '00000000-0000-0000-0000-00000000000a'$q$);
+    $q$UPDATE files.cloud_spaces SET allocated_bytes = 5368709120 WHERE owner_id = '00000000-0000-0000-0000-00000000000a'$q$);
 CALL pg_temp.expect_fail('Место в облаке: сверх выделенного новая загрузка не начнётся',
-    $q$UPDATE files.cloud_spaces SET reserved_bytes = reserved_bytes + 1024
-       WHERE owner_id = '00000000-0000-0000-0000-00000000000a'$q$, '23514');
+    $q$UPDATE files.cloud_spaces SET reserved_bytes = reserved_bytes + 1024 WHERE owner_id = '00000000-0000-0000-0000-00000000000a'$q$, '23514');
+CALL pg_temp.expect_ok('Место в облаке: FilePurged освобождает место по строке файла',
+    $q$SELECT 1 FROM files.cloud_spaces WHERE owner_id = '00000000-0000-0000-0000-00000000000a' FOR UPDATE;
+       WITH e AS (DELETE FROM files.space_entries WHERE file_id = '00000000-0000-0000-0000-0000000000aa'
+                  RETURNING owner_id, bytes, state)
+       UPDATE files.cloud_spaces s
+          SET used_bytes     = s.used_bytes     - CASE e.state WHEN 'used'     THEN e.bytes ELSE 0 END,
+              reserved_bytes = s.reserved_bytes - CASE e.state WHEN 'reserved' THEN e.bytes ELSE 0 END
+       FROM e WHERE s.owner_id = e.owner_id$q$,
+    $q$(SELECT used_bytes = 0 FROM files.cloud_spaces WHERE owner_id = '00000000-0000-0000-0000-00000000000a')$q$);
+CALL pg_temp.expect_ok('Место в облаке: повторный FilePurged ничего не вычитает',
+    $q$SELECT 1 FROM files.cloud_spaces WHERE owner_id = '00000000-0000-0000-0000-00000000000a' FOR UPDATE;
+       WITH e AS (DELETE FROM files.space_entries WHERE file_id = '00000000-0000-0000-0000-0000000000aa'
+                  RETURNING owner_id, bytes, state)
+       UPDATE files.cloud_spaces s
+          SET used_bytes     = s.used_bytes     - CASE e.state WHEN 'used'     THEN e.bytes ELSE 0 END,
+              reserved_bytes = s.reserved_bytes - CASE e.state WHEN 'reserved' THEN e.bytes ELSE 0 END
+       FROM e WHERE s.owner_id = e.owner_id$q$,
+    $q$(SELECT used_bytes = 0 AND reserved_bytes = 0 FROM files.cloud_spaces WHERE owner_id = '00000000-0000-0000-0000-00000000000a')$q$);
 CALL pg_temp.expect_ok('Место в облаке: выделенное снова 10 ГиБ',
-    $q$UPDATE files.cloud_spaces SET allocated_bytes = 10737418240, used_bytes = 0
-       WHERE owner_id = '00000000-0000-0000-0000-00000000000a'$q$);
+    $q$UPDATE files.cloud_spaces SET allocated_bytes = 10737418240 WHERE owner_id = '00000000-0000-0000-0000-00000000000a'$q$,
+    $q$(SELECT used_bytes + reserved_bytes = coalesce((SELECT sum(bytes) FROM files.space_entries WHERE owner_id = '00000000-0000-0000-0000-00000000000a'), 0)
+        FROM files.cloud_spaces WHERE owner_id = '00000000-0000-0000-0000-00000000000a')$q$);
 
 
 -- =====================================================================
@@ -459,6 +495,19 @@ CALL pg_temp.expect_fail('файл не может хранить байты в 
        VALUES (gen_random_uuid(), '00000000-0000-0000-0000-0000000000f7', '00000000-0000-0000-0000-00000000000b')$q$, '23503');
 CALL pg_temp.expect_fail('содержимое нельзя удалить, пока на него ссылается файл',
     $q$DELETE FROM content.contents WHERE id = '00000000-0000-0000-0000-0000000000f7'$q$, '23503');
+CALL pg_temp.expect_ok('Содержимое: дубликат привязан к проверенному содержимому сразу при старте загрузки',
+    $q$SELECT 1 FROM content.contents
+        WHERE owner_id = '00000000-0000-0000-0000-00000000000a' AND fingerprint = sha256('черновик')
+          AND status = 'verified' FOR UPDATE;
+       INSERT INTO content.content_files (file_id, content_id, owner_id)
+       VALUES ('00000000-0000-0000-0000-0000000000a9', '00000000-0000-0000-0000-0000000000f3',
+               '00000000-0000-0000-0000-00000000000a')$q$);
+CALL pg_temp.expect_ok('Содержимое: отвязка старого файла не удаляет содержимое, к которому привязан дубликат',
+    $q$SELECT 1 FROM content.contents WHERE id = '00000000-0000-0000-0000-0000000000f3' FOR UPDATE;
+       DELETE FROM content.content_files WHERE file_id = '00000000-0000-0000-0000-0000000000a3';
+       DELETE FROM content.contents c WHERE c.id = '00000000-0000-0000-0000-0000000000f3'
+         AND NOT EXISTS (SELECT 1 FROM content.content_files r WHERE r.content_id = c.id)$q$,
+    $q$EXISTS (SELECT 1 FROM content.contents WHERE id = '00000000-0000-0000-0000-0000000000f3')$q$);
 CALL pg_temp.expect_ok('Файл удалён навсегда: последняя ссылка снята, содержимое удаляется',
     $q$DELETE FROM content.content_files WHERE file_id = '00000000-0000-0000-0000-0000000000a2';
        DELETE FROM content.contents c WHERE c.id = '00000000-0000-0000-0000-0000000000f1'
